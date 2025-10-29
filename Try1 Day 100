@@ -5,4 +5,161 @@ git commit -m "first commit"
 git branch -M main
 git remote add origin git@github.com:estelles524-lang/Try1AiChangeCloth.git
 git push -u origin main
+const enc = new TextEncoder();
+const dec = new TextDecoder();
 
+function randomBytes(length) {
+  const b = new Uint8Array(length);
+  crypto.getRandomValues(b);
+  return b;
+}
+
+function bufToBase64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
+}
+
+function base64ToBuf(b64) {
+  const str = atob(b64);
+  const arr = new Uint8Array(str.length);
+  for (let i = 0; i < str.length; i++) arr[i] = str.charCodeAt(i);
+  return arr.buffer;
+}
+
+// Derive a CryptoKey from a password using PBKDF2 + SHA-256
+export async function deriveKeyFromPassword(password, salt, iterations = 200_000, keyLength = 256) {
+  const passwordKey = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(password),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+
+  const key = await crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: salt,
+      iterations: iterations,
+      hash: 'SHA-256'
+    },
+    passwordKey,
+    { name: 'AES-GCM', length: keyLength },
+    false,
+    ['encrypt', 'decrypt']
+  );
+
+  return key;
+}
+
+// Encrypt a UTF-8 string. Returns base64 string containing salt|iv|ciphertext
+export async function encryptString(plaintext, password) {
+  const salt = randomBytes(16);       // must be random per key derivation
+  const iv = randomBytes(12);         // 12 bytes recommended for AES-GCM
+  const key = await deriveKeyFromPassword(password, salt);
+
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv, tagLength: 128 },
+    key,
+    enc.encode(plaintext)
+  );
+
+  // package: salt || iv || ciphertext  (all base64)
+  const payload = {
+    salt: bufToBase64(salt),
+    iv: bufToBase64(iv),
+    ct: bufToBase64(ciphertext)
+  };
+
+  return JSON.stringify(payload);
+}
+
+// Decrypt the JSON payload returned by encryptString
+export async function decryptString(payloadJson, password) {
+  const payload = JSON.parse(payloadJson);
+  const salt = base64ToBuf(payload.salt);
+  const iv = base64ToBuf(payload.iv);
+  const ct = base64ToBuf(payload.ct);
+
+  const key = await deriveKeyFromPassword(password, salt);
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(iv), tagLength: 128 },
+    key,
+    ct
+  );
+
+  return dec.decode(plainBuf);
+}
+Uso en frontend (ejemplo)
+javascript
+Copiar código
+import { encryptString, decryptString } from './utils/crypto-utils.js';
+
+async function runDemo() {
+  const password = prompt("Contraseña para cifrar (no la subas al repo)");
+  const plain = "Mensaje secreto desde el navegador";
+
+  const encrypted = await encryptString(plain, password);
+  console.log("Payload para enviar al servidor:", encrypted);
+
+  const decrypted = await decryptString(encrypted, password);
+  console.log("Descifrado:", decrypted);
+}
+
+runDemo();
+2) Backend — Node.js + Express (desencriptar)
+Archivo ejemplo: server/index.js. Usa variable de entorno PASSWORD_SECRET (guárdala en GitHub Secrets).
+
+javascript
+Copiar código
+// server/index.js
+const express = require('express');
+const crypto = require('crypto');
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+// Config: derivación PBKDF2
+const PBKDF2_ITER = 200000;
+const KEY_LEN = 32; // 256 bits
+const DIGEST = 'sha256';
+
+// Helper: base64 <-> Buffer
+function b64ToBuf(s) { return Buffer.from(s, 'base64'); }
+function bufToB64(b) { return Buffer.from(b).toString('base64'); }
+
+function deriveKey(password, salt) {
+  // salt: Buffer
+  return crypto.pbkdf2Sync(password, salt, PBKDF2_ITER, KEY_LEN, DIGEST);
+}
+
+app.post('/decrypt', (req, res) => {
+  try {
+    // payload: { salt: "...", iv: "...", ct: "..." } encoded as JSON string or object
+    const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const password = process.env.PASSWORD_SECRET;
+    if (!password) return res.status(500).json({ error: 'Server key not configured' });
+
+    const salt = b64ToBuf(payload.salt);
+    const iv = b64ToBuf(payload.iv);
+    const ct = b64ToBuf(payload.ct);
+
+    const key = deriveKey(password, salt); // Buffer (32 bytes)
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    // AES-GCM requires auth tag appended or set separately; in our schema the tag is part of ciphertext buffer
+    // Node's createDecipheriv expects tag separated: last 16 bytes of ct is tag (if ciphertext contains tag appended)
+    // Our WebCrypto output includes the tag appended to ciphertext, so split it:
+    const tag = ct.slice(ct.length - 16);
+    const ciphertext = ct.slice(0, ct.length - 16);
+    decipher.setAuthTag(tag);
+
+    let decrypted = decipher.update(ciphertext, undefined, 'utf8');
+    decrypted += decipher.final('utf8');
+    return res.json({ plaintext: decrypted });
+  } catch (err) {
+    console.error(err);
+    return res.status(400).json({ error: 'Decryption failed' });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on :${PORT}`));
